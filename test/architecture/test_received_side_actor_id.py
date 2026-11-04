@@ -15,12 +15,20 @@
 """Architecture invariant: received-side execute_with_setup must use receiving_actor_id.
 
 Spec BT-17-006 (MUST): any received-side use case that calls
-``execute_with_setup`` MUST pass the *receiving* actor, the one
+``execute_with_setup`` MUST pass the *receiving* actor — the one
 ``resolve_receiving_actor_id`` returns (``request.receiving_actor_id``, else
-the store's owner, BT-17-009), never ``actor_id=request.actor_id`` (the
-sender).  Passing the sender ID scopes the DataLayer and GuardedCommit
-to the wrong actor, silently attributing ledger entries and state transitions
-to the remote peer.
+the store's owner, BT-17-009) — and never any other actor expression: not
+``actor_id=request.actor_id`` (the sender), not the sender under another
+binding, not a literal, not another attribute of the request, not a
+conditional that can fall back to the sender.  Passing the sender ID scopes
+the DataLayer and GuardedCommit to the wrong actor, silently attributing
+ledger entries and state transitions to the remote peer.
+
+The check is positive: every received-side ``execute()`` call of
+``execute_with_setup`` must pass the resolved receiving actor — a call to
+``resolve_receiving_actor_id``, a local bound from it, a
+``receiving_actor_id`` attribute, or a ``receiving_actor_id`` name — and the
+negative fixtures prove every other shape is rejected.
 
 Issue: #2338
 """
@@ -52,14 +60,55 @@ def _walk_own_scope(node: ast.AST):
         yield from _walk_own_scope(child)
 
 
-def _is_request_actor_id(node: ast.expr) -> bool:
-    """Return True for the AST node ``request.actor_id``."""
+def _is_resolve_receiving_call(node: ast.expr) -> bool:
+    """Return True for ``resolve_receiving_actor_id(...)`` (bare or method form)."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
     return (
-        isinstance(node, ast.Attribute)
-        and node.attr == "actor_id"
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "request"
+        isinstance(func, ast.Name) and func.id == "resolve_receiving_actor_id"
+    ) or (
+        isinstance(func, ast.Attribute)
+        and func.attr == "resolve_receiving_actor_id"
     )
+
+
+def _resolved_receiver_names(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[str]:
+    """Names the function binds to the receiving-actor resolver's result."""
+    names: set[str] = set()
+    for node in ast.walk(func):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name) and _is_resolve_receiving_call(
+                node.value
+            ):
+                names.add(target.id)
+    return names
+
+
+def _passes_receiving_actor(call: ast.Call, resolved: set[str]) -> bool:
+    """True when the call's ``actor_id`` is the resolved receiving actor."""
+    for kw in call.keywords:
+        if kw.arg != "actor_id":
+            continue
+        value = kw.value
+        if _is_resolve_receiving_call(value):
+            return True
+        is_receiving_attr = (
+            isinstance(value, ast.Attribute)
+            and value.attr == "receiving_actor_id"
+        )
+        is_receiver_name = isinstance(value, ast.Name) and (
+            value.id == "receiving_actor_id" or value.id in resolved
+        )
+        return is_receiving_attr or is_receiver_name
+    return False
 
 
 def _label(source_path: Path) -> str:
@@ -73,20 +122,20 @@ def _violations_in_execute(
     func: ast.FunctionDef | ast.AsyncFunctionDef,
     label: str,
 ) -> list[str]:
-    """Return 'label:lineno' for every execute_with_setup that passes request.actor_id."""
+    """Return 'label:lineno' for every execute_with_setup without the receiving actor."""
     results: list[str] = []
+    resolved = _resolved_receiver_names(func)
     for child in _walk_own_scope(func):
         if not _is_execute_with_setup_call(child):
             continue
         assert isinstance(child, ast.Call)
-        for kw in child.keywords:
-            if kw.arg == "actor_id" and _is_request_actor_id(kw.value):
-                results.append(f"{label}:{child.lineno}")
+        if not _passes_receiving_actor(child, resolved):
+            results.append(f"{label}:{child.lineno}")
     return results
 
 
 def _collect_violations_from_tree(tree: ast.AST, label: str) -> list[str]:
-    """Return 'file:lineno' entries where execute_with_setup passes request.actor_id."""
+    """Return 'file:lineno' entries where execute_with_setup misses the receiving actor."""
     violations: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -107,8 +156,8 @@ def _collect_violations(source_path: Path) -> list[str]:
     return _collect_violations_from_tree(tree, _label(source_path))
 
 
-def test_received_side_execute_with_setup_never_passes_request_actor_id():
-    """No received-side execute() may pass actor_id=request.actor_id to execute_with_setup.
+def test_received_side_execute_with_setup_uses_the_receiving_actor():
+    """Every received-side execute() passes the resolved receiving actor to execute_with_setup.
 
     Spec BT-17-006. Issue #2338.
     """
@@ -121,49 +170,57 @@ def test_received_side_execute_with_setup_never_passes_request_actor_id():
         )
 
     assert not all_violations, (
-        "received-side execute() calls pass actor_id=request.actor_id"
-        " (should pass the receiving actor from resolve_receiving_actor_id"
-        " — BT-17-006, issue #2338):\n"
+        "received-side execute() calls pass something other than the resolved"
+        " receiving actor (the resolver's call, a binding of its result, or"
+        " request.receiving_actor_id — BT-17-006, issue #2338):\n"
         + "\n".join(f"  {v}" for v in sorted(all_violations))
     )
 
 
-def test_detector_catches_synthetic_violation(tmp_path: Path) -> None:
-    """Confirm the detector flags a synthetic request.actor_id violation."""
-    violation_file = tmp_path / "synthetic_bad.py"
-    violation_file.write_text(
-        "class FakeUseCase:\n"
-        "    def execute(self):\n"
-        "        bridge.execute_with_setup(tree=t, actor_id=request.actor_id)\n",
-        encoding="utf-8",
-    )
-    violations = _collect_violations(violation_file)
-    assert violations, "Detector did not flag the synthetic violation"
-
-    ok_file = tmp_path / "synthetic_ok.py"
-    ok_file.write_text(
-        "class FakeUseCase:\n"
-        "    def execute(self):\n"
-        "        receiving_actor_id = request.receiving_actor_id\n"
-        "        bridge.execute_with_setup(tree=t, actor_id=receiving_actor_id)\n",
-        encoding="utf-8",
-    )
-    assert not _collect_violations(ok_file), (
-        "Detector produced a false positive for receiving_actor_id usage"
-    )
-
-    ok_inline_file = tmp_path / "synthetic_ok_inline.py"
-    ok_inline_file.write_text(
-        "class FakeUseCase:\n"
-        "    def execute(self):\n"
-        "        bridge.execute_with_setup(\n"
-        "            tree=t,\n"
-        "            actor_id=request.receiving_actor_id\n"
+def test_the_positive_check_rejects_any_other_actor_expression(tmp_path):
+    """Negative fixtures: a literal, the sender (directly, under another binding, via
+    ``self``, or behind a conditional fallback), or another request attribute must all
+    fail the check — only the resolved receiving actor passes."""
+    bad = [
+        'actor_id="hard-coded-id"',
+        "actor_id=req.actor_id",
+        "actor_id=self._request.actor_id",
+        "actor_id=request.object_id",
+        # A conditional that can still hand the call the sender is not the receiving actor.
+        "actor_id=request.receiving_actor_id\n"
         "                if request.receiving_actor_id is not None\n"
-        "                else request.actor_id,\n"
-        "        )\n",
-        encoding="utf-8",
-    )
-    assert not _collect_violations(ok_inline_file), (
-        "Detector produced a false positive for defensive inline form"
-    )
+        "                else request.actor_id",
+    ]
+    for arg in bad:
+        source = (
+            "class FakeUseCase:\n"
+            "    def execute(self, request, req):\n"
+            "        resolved = resolve_receiving_actor_id(dl, request.receiving_actor_id)\n"
+            f"        bridge.execute_with_setup(tree=tree, {arg}, activity=request)\n"
+        )
+        path = tmp_path / "bad.py"
+        path.write_text(source, encoding="utf-8")
+        assert _collect_violations(path), (
+            f"not rejected: {arg.splitlines()[0]}"
+        )
+
+
+def test_the_positive_check_accepts_the_resolved_receiving_actor(tmp_path):
+    """Positive fixtures: the resolver's call, a binding of its result, a
+    ``receiving_actor_id`` attribute and a ``receiving_actor_id`` name all pass."""
+    good = [
+        "actor_id=request.receiving_actor_id",
+        "actor_id=resolve_receiving_actor_id(dl, request.receiving_actor_id)",
+        "actor_id=receiving_actor_id",
+        "actor_id=resolved",
+    ]
+    for arg in good:
+        source = (
+            "class FakeUseCase:\n"
+            "    def execute(self, request, req):\n"
+            "        resolved = resolve_receiving_actor_id(dl, request.receiving_actor_id)\n"
+            f"        bridge.execute_with_setup(tree=tree, {arg}, activity=request)\n"
+        )
+        path = tmp_path / "good.py"
+        path.write_text(source, encoding="utf-8")
+        assert not _collect_violations(path), f"wrongly rejected: {arg}"

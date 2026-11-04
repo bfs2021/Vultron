@@ -1147,9 +1147,13 @@ groups:
       the ledger entry with no error. With per-actor storage, `actor_id` also selects
       the store, so a run as the sender reads and writes the wrong replica.
     verification: >-
-      `test_received_side_execute_with_setup_never_passes_request_actor_id` in
-      `test/architecture/test_received_side_actor_id.py` scans every received-side
-      call of `execute_with_setup` and fails on one that passes `request.actor_id`.
+      `test_received_side_execute_with_setup_uses_the_receiving_actor` in
+      `test/architecture/test_received_side_actor_id.py` requires every received-side
+      call of `execute_with_setup` to pass the resolved receiving actor — the
+      `resolve_receiving_actor_id(...)` call, a local bound from it, or
+      `request.receiving_actor_id` — and its negative fixtures fail on a literal, the
+      sender under another binding, another request attribute, or a conditional that
+      can fall back to the sender.
       `test_engage_without_receiving_actor_executes_as_store_owner` in
       `test/core/use_cases/received/case/test_engage_defer.py` runs a guarded-commit
       use case with no `receiving_actor_id`, so the store owner is the receiver, and
